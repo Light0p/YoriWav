@@ -1,0 +1,6 @@
+{
+  "firestore": {
+    "database": "ai-studio-echomusic-bafa18b9-c473-4835-beac-2537615581a4",
+    "rules": "firestore.rules"
+  }
+}

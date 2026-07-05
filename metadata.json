@@ -1,0 +1,6 @@
+{
+  "name": "Echo Music",
+  "description": "Echo Music — a cross-platform music streaming app with a brutalist, analogue aesthetic, real-time synced rooms, and shared chat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
