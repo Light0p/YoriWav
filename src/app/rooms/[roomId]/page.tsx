@@ -3,27 +3,33 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from "react";
-import { doc, collection, onSnapshot, query, orderBy, setDoc, deleteDoc, getDoc, updateDoc } from "firebase/firestore";
+import React, { useState, useEffect, useCallback } from "react";
+import { doc, collection, onSnapshot, getDoc, updateDoc, deleteDoc, setDoc } from "firebase/firestore";
 import { db } from "../../../lib/firebase/config";
 import { musicApi } from "../../../lib/providers/saavnProvider";
-import { calculateTargetTime, shouldSeek } from "../../../sync_math";
 import RoomView from "../../../components/RoomView";
-import { RoomModel, RoomMember, RoomMessage, TrackModel } from "../../../types";
+import { RoomModel, RoomMember, TrackModel } from "../../../types";
+import { useSyncEngine } from "../../../hooks/useSyncEngine";
+import { useHostControls } from "../../../hooks/useHostControls";
+import { useInactivityMonitor } from "../../../hooks/useInactivityMonitor";
 
 interface RoomPageProps {
-  roomId: string;
-  currentUser: any;
-  currentTrack: TrackModel | null;
-  setCurrentTrack: (track: TrackModel | null) => void;
-  isPlaying: boolean;
-  setIsPlaying: (playing: boolean) => void;
-  currentTime: number;
-  setCurrentTime: (time: number) => void;
-  audioRef: React.RefObject<HTMLAudioElement | null>;
-  onLeaveRoom: () => void;
+  roomId: string; // ID of the active broadcast room
+  currentUser: any; // Current user metadata
+  currentTrack: TrackModel | null; // React active player track state
+  setCurrentTrack: (track: TrackModel | null) => void; // Dispatched on sync updates
+  isPlaying: boolean; // Active state of local audio element
+  setIsPlaying: (playing: boolean) => void; // Updates local play state
+  currentTime: number; // Playback head position
+  setCurrentTime: (time: number) => void; // Syncs local timer
+  audioRef: React.RefObject<HTMLAudioElement | null>; // HTML Audio component reference
+  onLeaveRoom: () => void; // Callback executed on user exit
 }
 
+/**
+ * Sync Room View Controller.
+ * Subscribes to room states, manages user presence, and coordinates audio sync loops.
+ */
 export const RoomPage: React.FC<RoomPageProps> = ({
   roomId,
   currentUser,
@@ -38,17 +44,29 @@ export const RoomPage: React.FC<RoomPageProps> = ({
 }) => {
   const [roomState, setRoomState] = useState<RoomModel | null>(null);
   const [roomMembers, setRoomMembers] = useState<RoomMember[]>([]);
-  const [roomMessages, setRoomMessages] = useState<RoomMessage[]>([]);
   const [isJoined, setIsJoined] = useState(false);
   const [checkingJoin, setCheckingJoin] = useState(true);
-
-  const [isTabFocused, setIsTabFocused] = useState(typeof document !== "undefined" ? document.hasFocus() : true);
+  const [isArchived, setIsArchived] = useState(false);
+  const [isTabFocused, setIsTabFocused] = useState(
+    typeof document !== "undefined" ? document.hasFocus() : true
+  );
 
   const isHost = roomState ? roomState.hostId === currentUser?.uid : true;
+  const { play: hostPlay, pause: hostPause } = useHostControls();
 
-  // Watch tab focus state
+  // Bind inactivity monitor hook for the host user
+  useInactivityMonitor({
+    roomId,
+    isHost,
+    onInactive: () => {
+      setIsArchived(true);
+    }
+  });
+
+  // Watch browser window focus/blur states to suspend active Firestore listeners
   useEffect(() => {
     if (typeof window === "undefined") return;
+
     const handleFocus = () => setIsTabFocused(true);
     const handleBlur = () => setIsTabFocused(false);
 
@@ -61,7 +79,7 @@ export const RoomPage: React.FC<RoomPageProps> = ({
     };
   }, []);
 
-  // Check if current user is in guests or is host
+  // Check if current user is listed as a member in the room doc
   useEffect(() => {
     const checkMembership = async () => {
       try {
@@ -69,12 +87,20 @@ export const RoomPage: React.FC<RoomPageProps> = ({
         const snap = await getDoc(roomRef);
         if (snap.exists()) {
           const data = snap.data();
-          if (data.hostId === currentUser?.uid || (data.guests && data.guests.includes(currentUser?.uid))) {
+          // Redirect immediately if the target room has already been archived
+          if (data.isActive === false) {
+            setIsArchived(true);
+            return;
+          }
+          if (
+            data.hostId === currentUser?.uid ||
+            (data.guests && data.guests.includes(currentUser?.uid))
+          ) {
             setIsJoined(true);
           }
         }
       } catch (e) {
-        console.error("Error checking room membership:", e);
+        console.error("Error checking room membership details:", e);
       } finally {
         setCheckingJoin(false);
       }
@@ -82,101 +108,91 @@ export const RoomPage: React.FC<RoomPageProps> = ({
     checkMembership();
   }, [roomId, currentUser?.uid]);
 
-  // Handle Presence and Live Subscriptions once joined, suspended when tab is blurred/inactive
+  // Callback to sync guest stream audio URLs when track metadata updates
+  const handleTrackChange = useCallback(
+    (track: TrackModel) => {
+      musicApi.getStreamUrl(track)
+        .then((url) => {
+          const updatedTrack = { ...track, audioUrl: url || "" };
+          setCurrentTrack(updatedTrack);
+          if (audioRef.current) {
+            audioRef.current.src = url || "";
+          }
+        })
+        .catch((err) => {
+          console.error("Failed to sync stream URL on track change:", err);
+        });
+    },
+    [setCurrentTrack, audioRef]
+  );
+
+  // Bind the event-driven guest sync engine hook
+  useSyncEngine({
+    roomId,
+    audioRef,
+    isHost,
+    isTabFocused,
+    currentTrack,
+    onTrackChange: handleTrackChange,
+    setIsPlaying
+  });
+
+  // Handle Presence and room details sub-collection hooks, suspended on tab blur
   useEffect(() => {
     if (!isJoined || !isTabFocused) return;
 
-    // Sub to room details & sync audio
     const roomRef = doc(db, "rooms", roomId);
+
+    // Subscribe to parent room details to sync structural attributes (metadata, host info)
     const unsubRoom = onSnapshot(roomRef, (snapshot) => {
-      const data = snapshot.data() as RoomModel;
-      if (data) {
+      if (snapshot.exists()) {
+        const data = snapshot.data() as RoomModel;
+        // Dynamically transition guest view if host archives room
+        if (data.isActive === false) {
+          setIsArchived(true);
+          return;
+        }
         setRoomState(data);
-
-        // Find track matching room state or construct from room data
-        const targetTrack: TrackModel = {
-          videoId: data.trackId,
-          title: data.trackTitle,
-          artist: data.trackArtist,
-          thumbnailUrl: data.trackThumbnailUrl,
-          durationSeconds: 0,
-          audioUrl: ""
-        };
-
-        if (targetTrack && currentTrack?.videoId !== targetTrack.videoId) {
-          musicApi.getStreamUrl(targetTrack as any).then(url => {
-            targetTrack.audioUrl = url || "";
-            setCurrentTrack(targetTrack);
-            if (audioRef.current) {
-              audioRef.current.src = url || "";
-              if (data.isPlaying && !isHost) {
-                audioRef.current.play().catch(() => {});
-              }
-            }
-          }).catch(err => console.error("Failed to sync stream URL:", err));
-        }
-
-        // Apply Host-Guest sync logic
-        if (!isHost && audioRef.current) {
-          if (data.isPlaying && audioRef.current.paused) {
-            audioRef.current.play().catch(() => {});
-            setIsPlaying(true);
-          } else if (!data.isPlaying && !audioRef.current.paused) {
-            audioRef.current.pause();
-            setIsPlaying(false);
-          }
-
-          const targetPos = calculateTargetTime(data.position, data.updatedAt, 0);
-          if (shouldSeek(audioRef.current.currentTime, targetPos)) {
-            audioRef.current.currentTime = targetPos;
-          }
-        }
       }
     });
 
-    // Sub to presence
+    // Subscribe to presence sub-collection to render listening avatars in real-time
     const presenceRef = collection(db, "rooms", roomId, "presence");
     const unsubPresence = onSnapshot(presenceRef, (snapshot) => {
       const membersList: RoomMember[] = [];
-      snapshot.forEach(doc => {
-        membersList.push(doc.data() as RoomMember);
+      snapshot.forEach((snapDoc) => {
+        membersList.push(snapDoc.data() as RoomMember);
       });
       setRoomMembers(membersList);
     });
 
-    // Sub to message log
-    const messagesRef = query(collection(db, "rooms", roomId, "messages"), orderBy("timestamp"));
-    const unsubMessages = onSnapshot(messagesRef, (snapshot) => {
-      const list: RoomMessage[] = [];
-      snapshot.forEach(doc => {
-        list.push({ messageId: doc.id, ...doc.data() } as RoomMessage);
-      });
-      setRoomMessages(list);
-    });
-
-    // Write self to presence
+    // Write self user details to presence sub-collection
     if (currentUser) {
       const myPresenceRef = doc(db, "rooms", roomId, "presence", currentUser.uid);
       setDoc(myPresenceRef, {
         uid: currentUser.uid,
         displayName: currentUser.displayName || "Anonymous",
         photoUrl: currentUser.photoUrl || "",
-        joinedAt: Date.now()
+        isHost,
+        lastSeen: Date.now()
       });
     }
 
     return () => {
       unsubRoom();
       unsubPresence();
-      unsubMessages();
       if (currentUser) {
-        deleteDoc(doc(db, "rooms", roomId, "presence", currentUser.uid));
+        // Safe delete to detach user avatar from presence list instantly on blur/unmount
+        deleteDoc(doc(db, "rooms", roomId, "presence", currentUser.uid)).catch((e) => {
+          console.error("Failed to detach presence state:", e);
+        });
       }
     };
-  }, [isJoined, isTabFocused, roomId, currentUser]);
+  }, [isJoined, isTabFocused, roomId, currentUser, isHost]);
 
+  // Invoked when guest joins the broadcast deck
   const handleJoinSession = async () => {
-    setIsJoined(true); // Optimistic UI
+    setIsJoined(true); // Optimistic UX display toggle
     try {
       const roomRef = doc(db, "rooms", roomId);
       const snap = await getDoc(roomRef);
@@ -190,7 +206,7 @@ export const RoomPage: React.FC<RoomPageProps> = ({
         }
       } else {
         alert("This room does not exist.");
-        setIsJoined(false); // Rollback
+        setIsJoined(false);
         onLeaveRoom();
       }
     } catch (e) {
@@ -199,56 +215,69 @@ export const RoomPage: React.FC<RoomPageProps> = ({
     }
   };
 
-  const handleSendMessage = (content: string) => {
-    if (!currentUser) return;
-    const messagesRef = collection(db, "rooms", roomId, "messages");
-    setDoc(doc(messagesRef), {
-      uid: currentUser.uid,
-      displayName: currentUser.displayName || "Anonymous",
-      content: content,
-      timestamp: Date.now()
-    });
-  };
-
+  // Host playback toggles. Calls hostControls helper to trigger synchronization
   const handlePlayPause = () => {
-    if (!audioRef.current) return;
-    const nextIsPlaying = !isPlaying;
-    setIsPlaying(nextIsPlaying);
-    if (nextIsPlaying) {
-      audioRef.current.play().catch(() => {});
+    if (!currentTrack) return;
+    if (isPlaying) {
+      hostPause(audioRef, roomId, currentUser.uid, currentTrack);
     } else {
-      audioRef.current.pause();
-    }
-
-    if (isHost) {
-      const roomRef = doc(db, "rooms", roomId);
-      updateDoc(roomRef, {
-        isPlaying: nextIsPlaying,
-        position: audioRef.current.currentTime,
-        updatedAt: Date.now()
-      });
+      hostPlay(audioRef, roomId, currentUser.uid, currentTrack);
     }
   };
 
   if (checkingJoin) {
-    return <div className="h-full w-full flex items-center justify-center font-mono py-12 text-black">CHECKING_BROADCAST_STATUS...</div>;
+    return (
+      <div className="h-full w-full flex items-center justify-center font-mono py-12 text-black select-none">
+        CHECKING_BROADCAST_STATUS...
+      </div>
+    );
   }
 
+  // Archived landing deck overlay
+  if (isArchived) {
+    return (
+      <div className="w-full max-w-md mx-auto my-12 border-4 border-black bg-[#F5F0E8] p-8 shadow-[8px_8px_0_0_#000] flex flex-col gap-6 text-black select-none font-mono">
+        <h2 className="font-serif text-3xl font-bold uppercase border-b-4 border-black pb-3 text-[#CC0000]">
+          VIBE TERMINATED
+        </h2>
+        <p className="text-sm font-bold">
+          THIS BROADCAST DECK SYNCHRONIZATION HAS BEEN ARCHIVED DUE TO INACTIVITY LIMITATIONS:
+        </p>
+        <div className="bg-[#EDE8DF] border-2 border-black p-3 text-center font-bold break-all">
+          {roomId}
+        </div>
+        <button 
+          onClick={onLeaveRoom}
+          className="w-full py-4 border-2 border-black bg-black text-white font-bold uppercase hover:bg-white hover:text-black transition-colors cursor-pointer shadow-[3px_3px_0_0_#0D0D0D] active:translate-y-0.5 active:shadow-none"
+        >
+          [ RETURN TO DECK LOBBY ]
+        </button>
+      </div>
+    );
+  }
+
+  // Pre-join landing deck overlay
   if (!isJoined) {
     return (
-      <div className="w-full max-w-md mx-auto my-12 border-4 border-black bg-white p-8 shadow-[8px_8px_0_0_#000] flex flex-col gap-6 text-black">
-        <h2 className="font-serif text-3xl font-bold uppercase border-b-4 border-black pb-3">BROADCAST_SESSION</h2>
-        <p className="text-sm font-mono font-bold">YOU HAVE BEEN INVITED TO JOIN THE BROADCAST DECK:</p>
-        <div className="bg-[#f4f4f0] border-2 border-black p-3 text-center font-bold break-all">{roomId}</div>
+      <div className="w-full max-w-md mx-auto my-12 border-4 border-black bg-white p-8 shadow-[8px_8px_0_0_#000] flex flex-col gap-6 text-black select-none font-mono">
+        <h2 className="font-serif text-3xl font-bold uppercase border-b-4 border-black pb-3">
+          BROADCAST_SESSION
+        </h2>
+        <p className="text-sm font-mono font-bold">
+          YOU HAVE BEEN INVITED TO JOIN THE BROADCAST DECK:
+        </p>
+        <div className="bg-[#f4f4f0] border-2 border-black p-3 text-center font-bold break-all">
+          {roomId}
+        </div>
         <button 
           onClick={handleJoinSession}
-          className="w-full py-4 border-2 border-black bg-black text-white font-mono font-bold uppercase hover:bg-white hover:text-black transition-colors cursor-pointer"
+          className="w-full py-4 border-2 border-black bg-black text-white font-mono font-bold uppercase hover:bg-[#EDE8DF] hover:text-black transition-colors cursor-pointer shadow-[3px_3px_0_0_#0D0D0D] active:translate-y-0.5 active:shadow-none"
         >
           [ JOIN BROADCAST_SESSION ]
         </button>
         <button 
           onClick={onLeaveRoom}
-          className="w-full py-2 border-2 border-black bg-white text-black font-mono font-bold uppercase hover:bg-black hover:text-[#f4f4f0] transition-colors text-xs cursor-pointer"
+          className="w-full py-2 border-2 border-black bg-white text-black font-mono font-bold uppercase hover:bg-black hover:text-[#EDE8DF] transition-colors text-xs cursor-pointer shadow-[2px_2px_0_0_#0D0D0D]"
         >
           CANCEL
         </button>
@@ -261,13 +290,12 @@ export const RoomPage: React.FC<RoomPageProps> = ({
       roomId={roomId}
       roomState={roomState}
       members={roomMembers}
-      messages={roomMessages}
-      onSendMessage={handleSendMessage}
       onLeaveRoom={onLeaveRoom}
       currentUser={currentUser}
       isHost={isHost}
       onPlayPause={handlePlayPause}
       isPlaying={isPlaying}
+      isTabFocused={isTabFocused}
     />
   );
 };

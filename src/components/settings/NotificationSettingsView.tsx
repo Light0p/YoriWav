@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import { Terminal, BellRing, Cpu, Check } from "lucide-react";
+import BrutalistModal from "../shared/BrutalistModal";
 
 export default function NotificationSettingsView() {
   // Global Protocol States (Toggles)
@@ -12,15 +13,20 @@ export default function NotificationSettingsView() {
   const [playbackStart, setPlaybackStart] = useState(true);
   const [archiveUpdate, setArchiveUpdate] = useState(false);
 
+  const [showResetConfirmModal, setShowResetConfirmModal] = useState(false);
+
   const handleReset = () => {
-    if (confirm("WARNING: All customized notification protocols will be reset to factory defaults. Proceed?")) {
-      setEmailForwarding(true);
-      setPushRelay(false);
-      setHudAlerts(true);
-      setMemberJoin(true);
-      setPlaybackStart(true);
-      setArchiveUpdate(false);
-    }
+    setShowResetConfirmModal(true);
+  };
+
+  const confirmReset = () => {
+    setShowResetConfirmModal(false);
+    setEmailForwarding(true);
+    setPushRelay(false);
+    setHudAlerts(true);
+    setMemberJoin(true);
+    setPlaybackStart(true);
+    setArchiveUpdate(false);
   };
 
   return (
@@ -210,6 +216,32 @@ export default function NotificationSettingsView() {
         </div>
 
       </div>
+
+      <BrutalistModal
+        isOpen={showResetConfirmModal}
+        onClose={() => setShowResetConfirmModal(false)}
+        title="RESET FACTORY DEFAULTS?"
+        footer={
+          <div className="flex gap-3 w-full">
+            <button
+              onClick={() => setShowResetConfirmModal(false)}
+              className="flex-1 py-2 border-2 border-black bg-white text-black font-bold uppercase hover:bg-black hover:text-white transition-colors cursor-pointer text-xs"
+            >
+              [ CANCEL ]
+            </button>
+            <button
+              onClick={confirmReset}
+              className="flex-1 py-2 border-2 border-[#CC0000] bg-[#CC0000] text-white font-bold uppercase hover:bg-white hover:text-[#CC0000] transition-colors cursor-pointer text-xs"
+            >
+              [ RESET ]
+            </button>
+          </div>
+        }
+      >
+        <p className="font-mono text-xs text-black uppercase font-bold">
+          WARNING: ALL CUSTOM PROTOCOLS WILL BE RESTORED TO SYSTEM DEFAULTS.
+        </p>
+      </BrutalistModal>
     </div>
   );
 }

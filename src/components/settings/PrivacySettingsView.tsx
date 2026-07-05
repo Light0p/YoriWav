@@ -3,12 +3,14 @@ import { Shield, Skull } from "lucide-react";
 import { auth, db } from "../../firebase";
 import { onAuthStateChanged, deleteUser } from "firebase/auth";
 import { doc, getDoc, setDoc, updateDoc } from "firebase/firestore";
+import BrutalistModal from "../shared/BrutalistModal";
 
 export default function PrivacySettingsView() {
   const [publicPresence, setPublicPresence] = useState(true);
   const [discoveryIndex, setDiscoveryIndex] = useState(true);
   const [privateMode, setPrivateMode] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [showConfirmModal, setShowConfirmModal] = useState(false);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
@@ -69,25 +71,28 @@ export default function PrivacySettingsView() {
     }
   };
 
-  const handleTerminateAccount = async () => {
-    if (confirm("Are you sure?")) {
-      const user = auth.currentUser;
-      if (user) {
-        try {
-          await deleteUser(user);
-          alert("ECHO ACCOUNT TERMINATED. SYSTEM LOGOUT ENGAGED.");
-          window.location.reload();
-        } catch (error: any) {
-          console.error("Account termination failed:", error);
-          if (error.code === "auth/requires-recent-login") {
-            alert("SECURITY TRIGGER: Please sign out and sign in again before terminating your account.");
-          } else {
-            alert(`TERMINATION_ERROR: ${error.message}`);
-          }
+  const handleTerminateAccount = () => {
+    setShowConfirmModal(true);
+  };
+
+  const confirmTermination = async () => {
+    setShowConfirmModal(false);
+    const user = auth.currentUser;
+    if (user) {
+      try {
+        await deleteUser(user);
+        alert("ECHO ACCOUNT TERMINATED. SYSTEM LOGOUT ENGAGED.");
+        window.location.reload();
+      } catch (error: any) {
+        console.error("Account termination failed:", error);
+        if (error.code === "auth/requires-recent-login") {
+          alert("SECURITY TRIGGER: Please sign out and sign in again before terminating your account.");
+        } else {
+          alert(`TERMINATION_ERROR: ${error.message}`);
         }
-      } else {
-        alert("NO ACTIVE AUTH SESSION TO TERMINATE.");
       }
+    } else {
+      alert("NO ACTIVE AUTH SESSION TO TERMINATE.");
     }
   };
 
@@ -185,6 +190,32 @@ export default function PrivacySettingsView() {
           </div>
         </div>
       </div>
+
+      <BrutalistModal
+        isOpen={showConfirmModal}
+        onClose={() => setShowConfirmModal(false)}
+        title="TERMINATE ACCOUNT?"
+        footer={
+          <div className="flex gap-3 w-full">
+            <button
+              onClick={() => setShowConfirmModal(false)}
+              className="flex-1 py-2 border-2 border-black bg-white text-black font-bold uppercase hover:bg-black hover:text-white transition-colors cursor-pointer text-xs"
+            >
+              [ CANCEL ]
+            </button>
+            <button
+              onClick={confirmTermination}
+              className="flex-1 py-2 border-2 border-[#CC0000] bg-[#CC0000] text-white font-bold uppercase hover:bg-white hover:text-[#CC0000] transition-colors cursor-pointer text-xs"
+            >
+              [ DESTROY ]
+            </button>
+          </div>
+        }
+      >
+        <p className="font-mono text-xs text-black uppercase font-bold">
+          WARNING: THIS ACTION IS PERMANENT AND CANNOT BE UNDONE. ALL ACCOUNT ARCHIVES WILL BE TERMINATED.
+        </p>
+      </BrutalistModal>
     </div>
   );
 }

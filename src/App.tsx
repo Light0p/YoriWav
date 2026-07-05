@@ -56,7 +56,7 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
   throw new Error(JSON.stringify(errInfo));
 }
 
-import { collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, addDoc, query, orderBy, getDoc } from "firebase/firestore";
+import { collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, addDoc, query, orderBy, getDoc, serverTimestamp } from "firebase/firestore";
 import { onAuthStateChanged, User } from "firebase/auth";
 import { TrackModel, RoomModel, RoomMessage, RoomMember } from "./types";
 import { TRACKS } from "./tracks";
@@ -83,6 +83,9 @@ import CreateRoomModal from "./components/CreateRoomModal";
 import UserAvatar from "./components/UserAvatar";
 import { usePlaylistModal } from "./context/PlaylistModalContext";
 import useGhostInjection from "./hooks/useGhostInjection";
+import { useHostControls } from "./hooks/useHostControls";
+import { writeSyncState } from "./lib/firebase/syncHelpers";
+import BrutalistModal from "./components/shared/BrutalistModal";
 
 import { Disc, Menu, X, LogIn, Laptop } from "lucide-react";
 import BottomNav from "./components/BottomNav";
@@ -98,6 +101,8 @@ export default function App() {
   useGhostInjection("https://www.googletagmanager.com/gtag/js?id=G-XZV3B9NETP", "google-analytics");
 
   const { playlists, openModal } = usePlaylistModal();
+
+  const { seek: hostSeek } = useHostControls();
 
 
   
@@ -128,6 +133,7 @@ export default function App() {
   const [pendingRoomId, setPendingRoomId] = useState<string | null>(null);
   const [isCreateRoomOpen, setIsCreateRoomOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [customAlert, setCustomAlert] = useState<string | null>(null);
 
     const [mixerChannels, setMixerChannels] = useState({
     bass: 0,
@@ -147,6 +153,14 @@ export default function App() {
     if (eqNodesRef.current.mid) eqNodesRef.current.mid.gain.value = mixerChannels.mid;
     if (eqNodesRef.current.treble) eqNodesRef.current.treble.gain.value = mixerChannels.treble;
   }, [mixerChannels.bass, mixerChannels.mid, mixerChannels.treble]);
+
+  // Hijack native window.alert to render our custom BrutalistModal dialog overlay
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.alert = (message: string) => {
+      setCustomAlert(message);
+    };
+  }, []);
   const isHost = roomState ? roomState.hostId === currentUser?.uid : true;
 
   // Initialize Auth state listener
@@ -441,7 +455,17 @@ export default function App() {
         isPlaying: true,
         position: 0,
         updatedAt: Date.now()
-      }).catch(err => handleFirestoreError(err, OperationType.UPDATE, "rooms/" + activeRoomId));
+      }).catch(err => console.error("Parent room document update failed:", err));
+
+      // Publish active track sync change to state sub-collection
+      writeSyncState(activeRoomId, currentUser.uid, {
+        trackId: track.videoId || "",
+        trackTitle: track.title || "Unknown",
+        trackArtist: track.artist || "Unknown",
+        trackThumbnailUrl: track.thumbnailUrl || "",
+        status: "PLAYING",
+        hostSeekTime: 0
+      }).catch(err => console.error("Firestore sync write failed:", err));
     }
 
     try {
@@ -478,7 +502,17 @@ export default function App() {
         isPlaying: nextIsPlaying,
         position: audioRef.current.currentTime,
         updatedAt: Date.now()
-      }).catch(err => handleFirestoreError(err, OperationType.UPDATE, "rooms/" + activeRoomId));
+      }).catch(err => console.error("Parent room document playstate update failed:", err));
+
+      // Publish play/pause status update to sub-collection sync state
+      writeSyncState(activeRoomId, currentUser.uid, {
+        trackId: currentTrack?.videoId || "",
+        trackTitle: currentTrack?.title || "Unknown",
+        trackArtist: currentTrack?.artist || "Unknown",
+        trackThumbnailUrl: currentTrack?.thumbnailUrl || "",
+        status: nextIsPlaying ? "PLAYING" : "PAUSED",
+        hostSeekTime: audioRef.current.currentTime
+      }).catch(err => console.error("Firestore sync playstate write failed:", err));
     }
   };
 
@@ -492,7 +526,12 @@ export default function App() {
       updateDoc(roomRef, {
         position: seconds,
         updatedAt: Date.now()
-      }).catch(err => handleFirestoreError(err, OperationType.UPDATE, "rooms/" + activeRoomId));
+      }).catch(err => console.error("Parent room document seek update failed:", err));
+
+      if (currentTrack) {
+        // Delegate host seek update to use debounced sync writes
+        hostSeek(seconds, audioRef, activeRoomId, currentUser.uid, currentTrack);
+      }
     }
   };
 
@@ -525,8 +564,22 @@ export default function App() {
       isPlaying: isPlaying,
       position: currentTime,
       updatedAt: Date.now(),
-      guests: []
+      guests: [],
+      // Capped new fields for social decks
+      isActive: true,
+      lastActiveAt: serverTimestamp(),
+      hostUid: currentUser.uid
     }).then(() => {
+      // Publish active track sync change to state sub-collection
+      writeSyncState(newRoomId, currentUser.uid, {
+        trackId: track.videoId || "",
+        trackTitle: track.title || "Unknown",
+        trackArtist: track.artist || "Unknown",
+        trackThumbnailUrl: track.thumbnailUrl || "",
+        status: isPlaying ? "PLAYING" : "PAUSED",
+        hostSeekTime: currentTime
+      }).catch(err => console.error("Firestore initial sync write failed:", err));
+
       setActiveRoomId(newRoomId);
       setCurrentTab("room");
     });
@@ -546,8 +599,23 @@ export default function App() {
       isPlaying: isPlaying,
       position: currentTime,
       updatedAt: Date.now(),
-      guests: []
+      guests: [],
+      // Capped new fields for social decks
+      isActive: true,
+      lastActiveAt: serverTimestamp(),
+      hostUid: currentUser.uid
     });
+
+    // Publish active track sync change to state sub-collection
+    await writeSyncState(newRoomId, currentUser.uid, {
+      trackId: currentTrack.videoId || "",
+      trackTitle: currentTrack.title || "Unknown",
+      trackArtist: currentTrack.artist || "Unknown",
+      trackThumbnailUrl: currentTrack.thumbnailUrl || "",
+      status: isPlaying ? "PLAYING" : "PAUSED",
+      hostSeekTime: currentTime
+    });
+
     setActiveRoomId(newRoomId);
     setCurrentTab("room");
     return newRoomId;
@@ -771,6 +839,22 @@ export default function App() {
         </div>
 
         <PlaylistModal />
+        
+        <BrutalistModal
+          isOpen={!!customAlert}
+          onClose={() => setCustomAlert(null)}
+          title="SYSTEM NOTICE"
+        >
+          <div className="flex flex-col gap-4 font-mono text-xs font-bold text-black uppercase">
+            <p>{customAlert}</p>
+            <button
+              onClick={() => setCustomAlert(null)}
+              className="w-full py-2 border-2 border-black bg-black text-white hover:bg-white hover:text-black cursor-pointer font-bold transition-all uppercase"
+            >
+              [ ACKNOWLEDGE ]
+            </button>
+          </div>
+        </BrutalistModal>
         <CreateRoomModal 
           isOpen={isCreateRoomOpen}
           onClose={() => setIsCreateRoomOpen(false)}

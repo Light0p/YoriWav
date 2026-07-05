@@ -162,7 +162,7 @@ export default function PlaylistModal() {
                     <input
                       type="text"
                       required
-                      placeholder="MY AWESOME MIXTAPE"
+                      placeholder="VIBE SESSION"
                       value={playlistName}
                       onChange={(e) => setPlaylistName(e.target.value)}
                       className="w-full border-2 border-black bg-white p-3 text-sm font-bold uppercase focus:outline-none focus:ring-0 focus:border-black placeholder-gray-400"
